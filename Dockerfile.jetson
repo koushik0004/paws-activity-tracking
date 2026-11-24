@@ -1,0 +1,21 @@
+FROM dustynv/l4t-pytorch:r36.2.0
+
+WORKDIR /app
+
+# Install uv and Python dependencies
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
+COPY pyproject.toml uv.lock* ./
+RUN uv sync --frozen --no-dev || uv sync --no-dev
+
+# Copy vision pipeline, FastAPI service, and TensorRT compiler
+COPY pipeline.py app.py export_tensorrt.py ./
+COPY yolov8n.pt* ./
+
+ENV EVAL_MODE=false \
+    DEVICE=cuda \
+    LIVE_CAMERA_INDEX=0 \
+    PORT=8765
+
+EXPOSE 8765
+
+CMD ["uv", "run", "uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8765"]

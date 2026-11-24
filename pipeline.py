@@ -1,4 +1,6 @@
 
+import os
+
 import cv2
 import torch
 import numpy as np
@@ -99,7 +101,12 @@ class PawsVisionPipeline:
         device: Optional[str] = None,
     ):
         self.device = resolve_device(device)
-        self.detector = YOLO(detector_weights)
+        
+        # Prefer compiled FP16 TensorRT detector on Jetson CUDA if present
+        if self.device == "cuda" and os.path.exists("engines/yolov8n_fp16.engine"):
+            detector_weights = "engines/yolov8n_fp16.engine"
+
+        self.detector = YOLO(detector_weights, task="detect")
         self.target_classes = target_classes
         self.conf_threshold = conf_threshold
         self.kpt_conf_threshold = kpt_conf_threshold
@@ -113,7 +120,7 @@ class PawsVisionPipeline:
         self.pose_backend = "bbox_velocity_fallback"
         if use_animal_pose and RTMLIB_AVAILABLE:
             pose_src = pose_onnx_url_or_path or self.DEFAULT_AP10K_ONNX
-            ort_backend = "onnxruntime"
+            ort_backend = "tensorrt" if self.device == "cuda" else "onnxruntime"
             ort_device = "cuda" if self.device == "cuda" else "cpu"
             self.pose_model = RTMPose(
                 pose_src,
@@ -121,7 +128,7 @@ class PawsVisionPipeline:
                 backend=ort_backend,
                 device=ort_device,
             )
-            self.pose_backend = "ap10k_rtmpose"
+            self.pose_backend = f"ap10k_rtmpose_{ort_backend}"
 
         # State buffers
         self.center_history = deque(maxlen=smooth_window)
