@@ -8,6 +8,35 @@ from pydantic import BaseModel
 from ultralytics import YOLO
 from sklearn.cluster import KMeans
 
+try:
+    from rtmlib import PoseTracker, RTMPose
+    RTMLIB_AVAILABLE = True
+except ImportError:
+    RTMLIB_AVAILABLE = False
+
+# ==========================================
+# AP-10K 17-KEYPOINT QUADRUPED TOPOLOGY
+# ==========================================
+AP10K_KEYPOINTS = {
+    0: "left_eye",
+    1: "right_eye",
+    2: "nose",
+    3: "neck",
+    4: "root_of_tail",
+    5: "left_shoulder",
+    6: "left_elbow",
+    7: "left_front_paw",
+    8: "right_shoulder",
+    9: "right_elbow",
+    10: "right_front_paw",
+    11: "left_hip",
+    12: "left_knee",
+    13: "left_back_paw",
+    14: "right_hip",
+    15: "right_knee",
+    16: "right_back_paw",
+}
+
 
 # ==========================================
 # STRICT PYDANTIC OUTPUT SCHEMA
@@ -21,6 +50,8 @@ class PostureSchema(BaseModel):
     state: str
     held_ms: int
     reward_eligible: bool
+    pose_backend: str = "bbox_velocity_fallback"
+    mean_kpt_conf: float = 0.0
 
 
 class VisionPayload(BaseModel):
@@ -46,9 +77,17 @@ def resolve_device(preferred: Optional[str] = None) -> str:
 # MODULAR COMPUTER VISION PIPELINE CLASS
 # ==========================================
 class PawsVisionPipeline:
+    # Official OpenMMLab RTMPose-M trained on AP-10K (17 animal keypoints)
+    DEFAULT_AP10K_ONNX = (
+        "https://download.openmmlab.com/mmpose/v1/projects/rtmposev1/"
+        "onnx_sdk/rtmpose-m_simcc-ap10k_pt-aic-coco_210e-256x256-7a041aa1_20230206.zip"
+    )
+
     def __init__(
         self,
         detector_weights: str = "yolov8n.pt",
+        pose_onnx_url_or_path: Optional[str] = None,
+        use_animal_pose: bool = True,
         target_classes: list[int] = [16, 0],  # 16=dog, 0=person proxy
         conf_threshold: float = 0.50,
         framing_margin_pct: float = 0.10,
@@ -56,19 +95,38 @@ class PawsVisionPipeline:
         hold_gate_ms: int = 300,
         smooth_window: int = 5,
         fps: float = 25.0,
+        kpt_conf_threshold: float = 0.30,
         device: Optional[str] = None,
     ):
         self.device = resolve_device(device)
         self.detector = YOLO(detector_weights)
         self.target_classes = target_classes
         self.conf_threshold = conf_threshold
+        self.kpt_conf_threshold = kpt_conf_threshold
         self.framing_margin_pct = framing_margin_pct
         self.velocity_deadband_px_s = velocity_deadband_px_s
         self.hold_gate_ms = hold_gate_ms
         self.fps = fps if fps > 0 else 25.0
 
+        # Initialize AP-10K Animal Pose Estimator
+        self.pose_model = None
+        self.pose_backend = "bbox_velocity_fallback"
+        if use_animal_pose and RTMLIB_AVAILABLE:
+            pose_src = pose_onnx_url_or_path or self.DEFAULT_AP10K_ONNX
+            ort_backend = "onnxruntime"
+            ort_device = "cuda" if self.device == "cuda" else "cpu"
+            self.pose_model = RTMPose(
+                pose_src,
+                model_input_size=(256, 256),
+                backend=ort_backend,
+                device=ort_device,
+            )
+            self.pose_backend = "ap10k_rtmpose"
+
         # State buffers
         self.center_history = deque(maxlen=smooth_window)
+        self.pose_history = deque(maxlen=smooth_window)
+        self.last_stable_pose: Optional[str] = None
         self.stable_start_ms: Optional[int] = None
         self.frame_counter: int = 0
         self.cached_color: Optional[Tuple[Tuple[int, int, int], str]] = None
@@ -76,7 +134,9 @@ class PawsVisionPipeline:
     def reset_state(self):
         """Resets temporal buffers between video clips or training sessions."""
         self.center_history.clear()
+        self.pose_history.clear()
         self.stable_start_ms = None
+        self.last_stable_pose = None
         self.frame_counter = 0
         self.cached_color = None
 
@@ -102,8 +162,76 @@ class PawsVisionPipeline:
         hex_code = "#{:02X}{:02X}{:02X}".format(*rgb_tuple)
         return rgb_tuple, hex_code
 
+    def _classify_ap10k_posture(
+        self, keypoints: np.ndarray, scores: np.ndarray, bbox: Tuple[int, int, int, int]
+    ) -> Tuple[str, float]:
+        """
+        Classifies quadruped posture from 17 AP-10K keypoints normalized to bounding box:
+        - STANDING: Torso horizontal (<28 deg) & hips elevated above floor plane
+        - SITTING: Haunches/hips dropped near floor plane while shoulders/neck stay upright
+        - DOWN: Both shoulders and hips dropped near floor plane
+        - PAW_LIFT: Front paw lifted significantly while opposing front paw & hips stay grounded
+        """
+
+        x1, y1, x2, y2 = bbox
+        box_w = max(1.0, float(x2 - x1))
+        box_h = max(1.0, float(y2 - y1))
+
+        # Helper to safely average visible left/right joint pairs normalized to [0..1] in bbox
+        def avg_joint(idx_a: int, idx_b: int) -> Optional[np.ndarray]:
+            pts = []
+            for idx in (idx_a, idx_b):
+                if scores[idx] >= self.kpt_conf_threshold:
+                    nx = (keypoints[idx][0] - x1) / box_w
+                    ny = (keypoints[idx][1] - y1) / box_h
+                    pts.append([nx, ny])
+            return np.mean(pts, axis=0) if pts else None
+
+        mean_conf = float(np.mean(scores))
+        shoulder = avg_joint(5, 8)      # left/right shoulder
+        hip = avg_joint(11, 14)         # left/right hip (haunch)
+        front_paw = avg_joint(7, 10)    # left/right front paw
+        back_paw = avg_joint(13, 16)    # left/right back paw
+
+        # Require core torso landmarks (shoulder + hip) to avoid guessing on occluded bodies
+        if shoulder is None or hip is None:
+            return "UNKNOWN", round(mean_conf, 3)
+
+        # Estimate ground plane Y (bottom of visible paws or bottom of bbox = 1.0)
+        paw_ys = [p[1] for p in (front_paw, back_paw) if p is not None]
+        floor_y = max(paw_ys) if paw_ys else 0.95
+
+        # Spine angle relative to horizontal (0 deg = flat/standing, >45 deg = upright sitting)
+        dx = abs(shoulder[0] - hip[0]) + 1e-5
+        dy = abs(hip[1] - shoulder[1])
+        spine_angle_deg = float(np.degrees(np.arctan2(dy, dx)))
+
+        # Normalized height above floor (smaller = closer to ground)
+        hip_clearance = floor_y - hip[1]
+        shoulder_clearance = floor_y - shoulder[1]
+
+        # Check individual front paw lift (when both front paws are visible)
+        if scores[7] >= self.kpt_conf_threshold and scores[10] >= self.kpt_conf_threshold:
+            l_paw_y = (keypoints[7][1] - y1) / box_h
+            r_paw_y = (keypoints[10][1] - y1) / box_h
+            paw_delta_y = abs(l_paw_y - r_paw_y)
+            if paw_delta_y > 0.18 and hip_clearance < 0.35:
+                return "PAW_LIFT", round(mean_conf, 3)
+
+        # Posture taxonomy rules (aligned with PAWS Buddy A2 Section 21)
+        if shoulder_clearance < 0.28 and hip_clearance < 0.28:
+            return "DOWN", round(mean_conf, 3)
+        elif spine_angle_deg >= 38.0 and hip_clearance < 0.36:
+            return "SITTING", round(mean_conf, 3)
+        elif spine_angle_deg < 38.0 and hip_clearance >= 0.30:
+            return "STANDING", round(mean_conf, 3)
+        else:
+            # Fallback to Sitting vs Standing by hip-to-shoulder vertical ratio
+            return ("SITTING" if hip[1] > shoulder[1] + 0.18 else "STANDING"), round(mean_conf, 3)
+
+
     def process_frame(self, frame: np.ndarray, timestamp_ms: Optional[int] = None) -> VisionPayload:
-        """Runs end-to-end detection, framing check, kinematics, and returns VisionPayload."""
+        """Runs end-to-end detection, AP-10K pose estimation, kinematics, and returns VisionPayload."""
         self.frame_counter += 1
         ts_ms = timestamp_ms if timestamp_ms is not None else int((self.frame_counter - 1) * (1000.0 / self.fps))
         h, w = frame.shape[:2]
@@ -122,7 +250,7 @@ class PawsVisionPipeline:
                     self.cached_color = self._extract_dominant_color(roi)
                 dom_rgb, dom_hex = self.cached_color
 
-                # Smoothed center velocity
+                # Track global velocity to detect rapid walking/running
                 cx, cy = (x1 + x2) / 2.0, (y1 + y2) / 2.0
                 self.center_history.append((cx, cy))
 
@@ -133,13 +261,33 @@ class PawsVisionPipeline:
                 else:
                     vel_px_s = 0.0
 
-                pose_state = "MOVING" if vel_px_s > self.velocity_deadband_px_s else "SITTING"
-
-                if pose_state == "SITTING":
-                    if self.stable_start_ms is None:
-                        self.stable_start_ms = ts_ms
-                    held_ms = ts_ms - self.stable_start_ms
+                mean_kpt_conf = 0.0
+                if self.pose_model is not None and cls_id == 16:  # Quadruped pose on dog
+                    keypoints, scores = self.pose_model(frame, bboxes=[[x1, y1, x2, y2]])
+                    raw_pose, mean_kpt_conf = self._classify_ap10k_posture(
+                        keypoints[0], scores[0], (x1, y1, x2, y2)
+                    )
+                    if vel_px_s > self.velocity_deadband_px_s * 1.5:
+                        raw_pose = "MOVING"
                 else:
+                    # Fallback for human proxy (class 0) or when pose_model is disabled
+                    raw_pose = "MOVING" if vel_px_s > self.velocity_deadband_px_s else "SITTING"
+
+                # Majority-vote smoothing across rolling buffer to eliminate single-frame flicker
+                self.pose_history.append(raw_pose)
+                pose_state = max(set(self.pose_history), key=self.pose_history.count)
+                # Continuous hold gate (>= 300 ms) for stable rewardable poses
+                if pose_state in ("SITTING", "STANDING", "DOWN", "PAW_LIFT"):
+                    if self.last_stable_pose == pose_state:
+                        if self.stable_start_ms is None:
+                            self.stable_start_ms = ts_ms
+                        held_ms = ts_ms - self.stable_start_ms
+                    else:
+                        self.last_stable_pose = pose_state
+                        self.stable_start_ms = ts_ms
+                        held_ms = 0
+                else:
+                    self.last_stable_pose = None
                     self.stable_start_ms = None
                     held_ms = 0
 
@@ -151,11 +299,19 @@ class PawsVisionPipeline:
                     subject_detected=True,
                     framing_valid=framing_valid,
                     appearance=AppearanceSchema(dominant_color_hex=dom_hex, dominant_rgb=dom_rgb),
-                    posture=PostureSchema(state=pose_state, held_ms=held_ms, reward_eligible=eligible),
+                    posture=PostureSchema(
+                        state=pose_state,
+                        held_ms=held_ms,
+                        reward_eligible=eligible,
+                        pose_backend=self.pose_backend,
+                        mean_kpt_conf=mean_kpt_conf,
+                    ),
                 )
 
         # Fallback when no subject is detected
         self.center_history.clear()
+        self.pose_history.clear()
+        self.last_stable_pose = None
         self.stable_start_ms = None
         return VisionPayload(
             frame_id=self.frame_counter,
@@ -163,5 +319,11 @@ class PawsVisionPipeline:
             subject_detected=False,
             framing_valid=False,
             appearance=AppearanceSchema(dominant_color_hex="#000000", dominant_rgb=(0, 0, 0)),
-            posture=PostureSchema(state="UNKNOWN", held_ms=0, reward_eligible=False),
+            posture=PostureSchema(
+                state="UNKNOWN",
+                held_ms=0,
+                reward_eligible=False,
+                pose_backend=self.pose_backend,
+                mean_kpt_conf=0.0,
+            ),
         )
