@@ -2,12 +2,12 @@
 
 ## Index of Classes & Data Models
 
-### Vision Pipeline Schemas ([pipeline.py](file:///Users/koushiksadhukhan/projects/paws-buddy/pipeline.py))
+### Vision Pipeline Schemas ([src/paws_buddy/schemas.py](file:///Users/koushiksadhukhan/projects/paws-buddy/src/paws_buddy/schemas.py))
 - **`AppearanceSchema`** (`pydantic.BaseModel`):
   - `dominant_color_hex`: Hex color string representing the coat (e.g. `"#8A6543"`).
   - `dominant_rgb`: Tuple of `(R, G, B)` integer values.
 - **`PostureSchema`** (`pydantic.BaseModel`):
-  - `state`: Detected pose state (`"SITTING"`, `"MOVING"`, `"UNKNOWN"`).
+  - `state`: Detected pose state (`"SITTING"`, `"STANDING"`, `"DOWN"`, `"PAW_LIFT"`, `"CROUCHING"`, `"MOVING"`, `"UNKNOWN"`).
   - `held_ms`: Milliseconds the posture has been continuously held without moving.
   - `reward_eligible`: Boolean flag indicating if posture is held $\ge 300\text{ms}$ and inside the safe framing margin.
 - **`VisionPayload`** (`pydantic.BaseModel`):
@@ -18,7 +18,7 @@
   - `appearance`: Instance of `AppearanceSchema`.
   - `posture`: Instance of `PostureSchema`.
 
-### State Machine Schemas ([app.py](file:///Users/koushiksadhukhan/projects/paws-buddy/app.py))
+### State Machine Schemas ([src/paws_buddy/schemas.py](file:///Users/koushiksadhukhan/projects/paws-buddy/src/paws_buddy/schemas.py))
 - **`CueRequest`** (`pydantic.BaseModel`):
   - `command_pose`: Target posture command (`"SITTING"`, `"STANDING"`, `"DOWN"`, `"PAW_LIFT"`). Default: `"SITTING"`.
   - `window_ms`: Duration in milliseconds before cue expires (default: 5000ms).
@@ -41,16 +41,20 @@
 
 ## Core Classes & Methods
 
-### `PawsVisionPipeline` ([pipeline.py](file:///Users/koushiksadhukhan/projects/paws-buddy/pipeline.py))
+### `PawsVisionPipeline` ([src/paws_buddy/pipeline.py](file:///Users/koushiksadhukhan/projects/paws-buddy/src/paws_buddy/pipeline.py))
 - `__init__(detector_weights, target_classes, conf_threshold, framing_margin_pct, velocity_deadband_px_s, hold_gate_ms, smooth_window, fps, device)`: Initializes YOLO model and temporal smoothing buffers.
 - `reset_state()`: Clears center history, stable start timestamps, and cached coat colors.
-- `_check_framing_margin(bbox, w, h)`: Computes boundary margins and checks if bounding box stays inside `[margin, 1 - margin]`.
-- `_extract_dominant_color(roi_bgr, k)`: Runs K-Means clustering on central crop of bounding box to identify predominant coat color.
 - `process_frame(frame, timestamp_ms)`: Executes object detection, kinematics smoothing, pose determination, and returns `VisionPayload`.
+
+### Pure Vision & Math Functions ([src/paws_buddy/vision.py](file:///Users/koushiksadhukhan/projects/paws-buddy/src/paws_buddy/vision.py))
+- `check_framing_margin(bbox, frame_width, frame_height, margin_pct)`: Computes boundary margins and checks if bounding box stays inside `[margin, 1 - margin]`.
+- `extract_dominant_color(roi_bgr, k)`: Runs K-Means clustering on central crop of bounding box to identify predominant coat color.
+- `joint_angle(a, b, c)`: Computes interior angle in degrees at joint b formed by points a-b-c.
+- `classify_ap10k_posture(keypoints, scores, bbox, kpt_conf_threshold)`: Evaluates limb elevation above floor plane to classify quadruped posture (`STANDING`, `CROUCHING`, `DOWN`, `SITTING`, `PAW_LIFT`).
 
 ---
 
-## API Endpoints ([app.py](file:///Users/koushiksadhukhan/projects/paws-buddy/app.py))
+## API Endpoints ([src/paws_buddy/routes.py](file:///Users/koushiksadhukhan/projects/paws-buddy/src/paws_buddy/routes.py))
 
 | Method | Endpoint | Description |
 | :--- | :--- | :--- |

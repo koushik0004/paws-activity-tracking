@@ -16,11 +16,16 @@ paws-buddy/
 │   └── local_stream_verified.mp4
 ├── src/
 │   └── paws_buddy/              # Core installable Python package module
-│       └── __init__.py          # Package entry point
+│       ├── __init__.py          # Package entry point & root export facade
+│       ├── schemas.py           # Pydantic schemas (Vision & Session contracts)
+│       ├── vision.py            # Geometric math, framing margin, color & AP-10K classifier
+│       ├── pipeline.py          # PawsVisionPipeline class & hardware device resolution
+│       ├── routes.py            # FastAPI APIRouter endpoints & session evaluation
+│       └── app.py               # Application factory `create_app()` & CLI main entrypoint
 ├── .env                         # Environment variables (runtime overrides)
 ├── .gitignore                   # Git exclusion rules
-├── app.py                       # FastAPI application & session state machine routes
-├── pipeline.py                  # Computer vision pipeline, YOLOv8 detector & kinematics
+├── app.py                       # Root backward-compatible entrypoint shim for uvicorn
+├── pipeline.py                  # Root backward-compatible entrypoint shim for pipeline imports
 ├── yolov8n.pt                   # Pretrained YOLOv8 nano model weights
 ├── Dockerfile                   # Container specification with uv & uvicorn hot-reload
 ├── docker-compose.yml           # Compose service with live volume mounting

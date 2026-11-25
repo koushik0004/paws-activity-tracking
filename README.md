@@ -27,14 +27,15 @@ PAWS Buddy is a real-time computer vision service designed to assist in automate
                       +-------------------+-------------------+
                                           |
                       +-------------------v-------------------+
-                      |      FastAPI Server (app.py)          |
+                      |      FastAPI Server (routes.py)       |
                       +-------------------+-------------------+
                                           |
                       +-------------------v-------------------+
                       |  PawsVisionPipeline (pipeline.py)     |
                       |  - YOLOv8 Object Detection            |
                       |  - 10% Framing Margin Check           |
-                      |  - K-Means Dominant Color             |
+                      |  - K-Means Dominant Color (vision.py) |
+                      |  - AP-10K Posture Clf (vision.py)     |
                       |  - Centroid Velocity & Hold Tracking  |
                       +-------------------+-------------------+
                                           |
@@ -46,6 +47,21 @@ PAWS Buddy is a real-time computer vision service designed to assist in automate
                                           v
                       [Trigger ESP32 Treat Tosser Hardware]
 ```
+
+---
+
+## Codebase Modularization & Architecture Refactoring
+
+To maintain high code quality and make files easy to review, test, and upload into Gemini Chat Web, the codebase was decomposed from two monolithic scripts (`pipeline.py` 392 LOC and `app.py` 304 LOC) into a structured package under `src/paws_buddy/` while retaining root backward-compatible facades:
+
+- **Data Models (`src/paws_buddy/schemas.py`)**: All Pydantic v2 schemas (`VisionPayload`, `SessionState`, `CueRequest`, benchmark reports) and AP-10K topology constants are decoupled with zero ML dependencies.
+- **Pure Vision Algorithms (`src/paws_buddy/vision.py`)**: Boundary margin checks, K-Means color clustering, vector joint angles, and perspective-invariant AP-10K posture classifiers (`SITTING`, `STANDING`, `DOWN`, `PAW_LIFT`, `CROUCHING`).
+- **Inference Pipeline (`src/paws_buddy/pipeline.py`)**: Stateful `PawsVisionPipeline` managing device resolution (MPS/CUDA/CPU), YOLOv8 detection, RTMPose estimation, and temporal hysteresis.
+- **API Routing (`src/paws_buddy/routes.py`)**: FastAPI `APIRouter` managing training session state machine transitions and video stream benchmarking.
+- **App Factory (`src/paws_buddy/app.py`)**: Clean application factory (`create_app()`) and CLI runner.
+- **Backward Compatibility**: Root `app.py` and `pipeline.py` act as drop-in re-export facades, ensuring `uvicorn app:app`, `make run`, and Docker setups continue working unchanged.
+
+> Detailed decomposition and function mappings are documented in [docs/updated-app-structure.md](file:///Users/koushiksadhukhan/projects/paws-buddy/docs/updated-app-structure.md).
 
 ---
 
@@ -212,8 +228,8 @@ Annotated videos are saved in the `outputs/` directory (e.g. `outputs/local_stre
 
 ```
 paws-buddy/
-├── app.py                  # FastAPI application & session state machine routes
-├── pipeline.py             # Vision pipeline (YOLOv8, framing, kinematics, color)
+├── app.py                  # Root backward-compatible facade for uvicorn & Makefile
+├── pipeline.py             # Root backward-compatible facade for pipeline imports
 ├── yolov8n.pt              # Pretrained YOLOv8 nano weights
 ├── Makefile                # Automation commands (make run, docker-up, etc.)
 ├── Dockerfile              # Container definition with uv & uvicorn
@@ -221,8 +237,16 @@ paws-buddy/
 ├── pyproject.toml          # Project metadata and dependencies managed by uv
 ├── .env                    # Runtime environment configuration
 ├── data/                   # Sample test videos (dog-1.mp4, huskey-1.mp4, etc.)
+├── docs/                   # Architecture, migration, and restructuring documentation
+│   └── updated-app-structure.md
 ├── outputs/                # Evaluation benchmark videos and debug output
-└── src/paws_buddy/         # Core package source directory
+└── src/paws_buddy/         # Core modular package
+    ├── __init__.py         # Package exports facade
+    ├── schemas.py          # Pure Pydantic v2 data models & AP-10K keypoint constants
+    ├── vision.py           # Framing margins, K-Means color, joint angles & pose classifier
+    ├── pipeline.py         # Stateful PawsVisionPipeline & device selection (MPS/CUDA/CPU)
+    ├── routes.py           # FastAPI APIRouter endpoints & session evaluation
+    └── app.py              # Application factory `create_app()` & CLI entrypoint
 ```
 
 ---
