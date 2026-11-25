@@ -55,6 +55,14 @@ class CueEvaluationResponse(BaseModel):
     trigger_esp32_toss: bool
     reason: str
 
+class PostureSegment(BaseModel):
+    segment_id: int
+    start_timestamp_ms: int
+    end_timestamp_ms: int
+    state: str
+    held_ms: int
+    avg_kpt_conf: float
+
 current_session = SessionState()
 
 def _now_ms() -> int:
@@ -69,6 +77,8 @@ class StreamBenchmarkReport(BaseModel):
     effective_fps: float
     meets_200ms_target: bool
     eligible_frames_count: int
+    posture_counts: dict[str, int]
+    postures: list[PostureSegment]
     annotated_video_path: Optional[str]
     sample_frame_10: Optional[VisionPayload]
 
@@ -207,6 +217,10 @@ def evaluate_stream(
     eligible_count = 0
     sample_f10: Optional[VisionPayload] = None
 
+    # NEW 1: Track posture counts and timeline segments across the clip
+    posture_counts: dict[str, int] = {}
+    segments: list[dict] = []
+
     for idx in range(1, max_frames + 1):
         ret, frame = cap.read()
         if not ret:
@@ -221,6 +235,27 @@ def evaluate_stream(
             eligible_count += 1
         if idx == 10:
             sample_f10 = payload
+
+        # NEW 2: Record posture count + group consecutive frames into segments
+        st = payload.posture.state
+        ts = payload.timestamp_ms
+        conf = payload.posture.mean_kpt_conf
+        posture_counts[st] = posture_counts.get(st, 0) + 1
+
+        if segments and segments[-1]["state"] == st:
+            seg = segments[-1]
+            seg["end_timestamp_ms"] = ts
+            seg["held_ms"] = ts - seg["start_timestamp_ms"]
+            seg["confs"].append(conf)
+        else:
+            segments.append({
+                "segment_id": len(segments) + 1,
+                "start_timestamp_ms": ts,
+                "end_timestamp_ms": ts,
+                "state": st,
+                "held_ms": 0,
+                "confs": [conf],
+            })
 
         if writer:
             color = (0, 255, 0) if payload.posture.reward_eligible else (0, 200, 255)
@@ -240,6 +275,19 @@ def evaluate_stream(
     avg_ms = float(np.mean(steady_latencies))
     max_ms = float(np.max(steady_latencies))
 
+    # NEW 3: Convert raw segment dicts into PostureSegment objects
+    posture_segments = [
+        PostureSegment(
+            segment_id=s["segment_id"],
+            start_timestamp_ms=s["start_timestamp_ms"],
+            end_timestamp_ms=s["end_timestamp_ms"],
+            state=s["state"],
+            held_ms=s["held_ms"],
+            avg_kpt_conf=round(sum(s["confs"]) / len(s["confs"]), 3),
+        )
+        for s in segments
+    ]
+
     return StreamBenchmarkReport(
         source=str(source),
         device=vision_engine.device,
@@ -249,6 +297,8 @@ def evaluate_stream(
         effective_fps=round(1000.0 / avg_ms, 1) if avg_ms > 0 else 0.0,
         meets_200ms_target=(max_ms <= 200.0),
         eligible_frames_count=eligible_count,
+        posture_counts=posture_counts,
+        postures=posture_segments,
         annotated_video_path=out_path,
         sample_frame_10=sample_f10
     )
