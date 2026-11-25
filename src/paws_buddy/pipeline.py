@@ -150,6 +150,10 @@ class PawsVisionPipeline:
             mean_kpt_conf = 0.0
             if self.pose_model is not None and best_cls_id == 16:
                 keypoints, scores = self.pose_model(frame, bboxes=[[x1, y1, x2, y2]])
+                # NEW: Cache latest bbox and 17 keypoints for debug skeleton rendering
+                self.last_bbox = (x1, y1, x2, y2)
+                self.last_keypoints = keypoints[0]
+                self.last_scores = scores[0]
                 raw_pose, mean_kpt_conf = classify_ap10k_posture(
                     keypoints[0], scores[0], (x1, y1, x2, y2), self.kpt_conf_threshold
                 )

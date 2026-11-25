@@ -15,6 +15,8 @@ from paws_buddy.schemas import (
     StreamBenchmarkReport,
     VisionPayload,
 )
+# NEW: Add import at top of src/paws_buddy/routes.py
+from paws_buddy.vision import draw_ap10k_skeleton
 
 router = APIRouter()
 
@@ -230,6 +232,15 @@ def evaluate_stream(
             })
 
         if writer:
+            # NEW: Draw 17-keypoint AP-10K skeleton overlay if pose attributes are cached on engine
+            if getattr(engine, "last_keypoints", None) is not None and getattr(engine, "last_scores", None) is not None:
+                frame = draw_ap10k_skeleton(
+                    frame,
+                    engine.last_keypoints,
+                    engine.last_scores,
+                    bbox=getattr(engine, "last_bbox", None),
+                    conf_thresh=engine.kpt_conf_threshold,
+                )
             color = (0, 255, 0) if payload.posture.reward_eligible else (0, 200, 255)
             hud = f"F{idx:02d} | {payload.posture.state} ({payload.posture.held_ms}ms) | {elapsed_ms:.1f}ms"
             cv2.putText(frame, hud, (20, 45), cv2.FONT_HERSHEY_SIMPLEX, 0.75, color, 2)
